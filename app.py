@@ -1,5 +1,6 @@
 import streamlit as st
 import requests
+import pandas as pd
 
 BACKEND_URL = "http://127.0.0.1:8000"
 
@@ -20,6 +21,8 @@ if "username" not in st.session_state:
     st.session_state.username = None
 if "role" not in st.session_state:
     st.session_state.role = None
+if "current_project" not in st.session_state:
+    st.session_state.current_project = "default"
 
 
 if not st.session_state.logged_in:
@@ -78,7 +81,51 @@ with st.sidebar:
         st.session_state.logged_in = False
         st.session_state.username = None
         st.session_state.role = None
+        st.session_state.current_project = "default"
         st.rerun()
+
+    st.divider()
+    st.header("🗂️ Project")
+    try:
+        projects_response = requests.get(f"{BACKEND_URL}/projects")
+        projects_result = projects_response.json()
+        if projects_result.get("status") == "error":
+            st.error(projects_result.get("message", "Could not load projects."))
+            project_names = ["default"]
+        else:
+            project_names = [p["name"] for p in projects_result.get("projects", [])]
+            if not project_names:
+                project_names = ["default"]
+    except Exception:
+        project_names = ["default"]
+
+    if st.session_state.current_project not in project_names:
+        st.session_state.current_project = project_names[0]
+
+    # Keep the active project as the source of truth, separate from widget state.
+    st.session_state.pop("project_selector_widget", None)
+    selected_project = st.selectbox(
+        "Active project",
+        project_names,
+        index=project_names.index(st.session_state.current_project),
+        key="project_selector_widget"
+    )
+    if selected_project != st.session_state.current_project:
+        st.session_state.current_project = selected_project
+        st.rerun()
+
+    new_project = st.text_input("Create new project", key="new_project_name")
+    if st.button("Create Project"):
+        project_response = requests.post(
+            f"{BACKEND_URL}/projects",
+            data={"name": new_project, "username": st.session_state.username}
+        )
+        project_result = project_response.json()
+        if project_result.get("status") == "success":
+            st.session_state.current_project = project_result["project"]
+            st.rerun()
+        else:
+            st.error(project_result.get("message", "Could not create project."))
 
     st.divider()
     st.header("📄 Document Upload")
@@ -88,7 +135,11 @@ with st.sidebar:
         if st.button("Ingest Document"):
             with st.spinner("Processing document... extracting, chunking, embedding..."):
                 files = {"file": (uploaded_file.name, uploaded_file.getvalue(), "application/pdf")}
-                response = requests.post(f"{BACKEND_URL}/upload", files=files)
+                response = requests.post(
+                    f"{BACKEND_URL}/upload",
+                    files=files,
+                    data={"project": st.session_state.current_project}
+                )
                 if response.status_code == 200:
                     result = response.json()
                     if result.get("status") == "success":
@@ -102,14 +153,21 @@ with st.sidebar:
     st.divider()
     st.header("📊 Knowledge Base Status")
     try:
-        status = requests.get(f"{BACKEND_URL}/status").json()
-        st.metric("Total Chunks", status["total_chunks"])
-        st.write("**Documents ingested:**")
-        if status["documents"]:
-            for doc in status["documents"]:
-                st.write(f"- {doc}")
+        status_response = requests.get(
+            f"{BACKEND_URL}/status",
+            params={"project": st.session_state.current_project}
+        )
+        status = status_response.json()
+        if status.get("status") == "error":
+            st.error(status.get("message", "Could not load knowledge base status."))
         else:
-            st.write("_No documents yet_")
+            st.metric("Total Chunks", status["total_chunks"])
+            st.write("**Documents ingested:**")
+            if status["documents"]:
+                for doc in status["documents"]:
+                    st.write(f"- {doc}")
+            else:
+                st.write("_No documents yet_")
     except Exception as e:
         st.error("Backend not reachable. Is uvicorn running?")
 
@@ -132,7 +190,15 @@ with tab1:
         top_k = st.slider("Sources to retrieve", 1, 10, 4)
     with col2:
         try:
-            doc_options = ["All Documents"] + requests.get(f"{BACKEND_URL}/status").json().get("documents", [])
+            status = requests.get(
+                f"{BACKEND_URL}/status",
+                params={"project": st.session_state.current_project}
+            ).json()
+            if status.get("status") == "error":
+                st.error(status.get("message", "Could not load documents."))
+                doc_options = ["All Documents"]
+            else:
+                doc_options = ["All Documents"] + status.get("documents", [])
         except Exception:
             doc_options = ["All Documents"]
         selected_doc = st.selectbox("Search within", doc_options)
@@ -145,13 +211,19 @@ with tab1:
                     "question": question,
                     "top_k": top_k,
                     "source_filter": selected_doc,
-                    "username": st.session_state.username
+                    "username": st.session_state.username,
+                    "project": st.session_state.current_project
                 }
             )
             if response.status_code == 200:
-                st.session_state.last_result = response.json()
-                st.session_state.last_question = question
-                st.session_state.last_doc = selected_doc
+                result = response.json()
+                if result.get("status") == "error":
+                    st.error(result.get("message", "Query failed."))
+                    st.session_state.last_result = None
+                else:
+                    st.session_state.last_result = result
+                    st.session_state.last_question = question
+                    st.session_state.last_doc = selected_doc
             else:
                 st.error(f"Query failed: {response.text}")
                 st.session_state.last_result = None
@@ -217,7 +289,15 @@ with tab2:
     st.caption("Extract components, interfaces, ports, and signals mentioned in a document.")
 
     try:
-        doc_list = requests.get(f"{BACKEND_URL}/status").json().get("documents", [])
+        status = requests.get(
+            f"{BACKEND_URL}/status",
+            params={"project": st.session_state.current_project}
+        ).json()
+        if status.get("status") == "error":
+            st.error(status.get("message", "Could not load documents."))
+            doc_list = []
+        else:
+            doc_list = status.get("documents", [])
     except Exception:
         doc_list = []
 
@@ -227,7 +307,13 @@ with tab2:
         entity_doc = st.selectbox("Select a document to analyze", doc_list, key="entity_doc_select")
         if st.button("Extract Entities"):
             with st.spinner("Analyzing document for components, interfaces, ports, and signals..."):
-                resp = requests.post(f"{BACKEND_URL}/extract_entities", data={"source": entity_doc})
+                resp = requests.post(
+                    f"{BACKEND_URL}/extract_entities",
+                    data={
+                        "source": entity_doc,
+                        "project": st.session_state.current_project
+                    }
+                )
                 if resp.status_code == 200:
                     result = resp.json()
                     if result.get("status") == "success":
@@ -252,21 +338,38 @@ with tab2:
 
         st.divider()
         if st.button("📥 Export Document Data as JSON"):
-            export_resp = requests.get(f"{BACKEND_URL}/export/{entity_doc}")
+            export_resp = requests.get(
+                f"{BACKEND_URL}/export/{entity_doc}",
+                params={"project": st.session_state.current_project}
+            )
             if export_resp.status_code == 200:
-                st.download_button(
-                    "Download JSON",
-                    data=export_resp.text,
-                    file_name=f"{entity_doc}_export.json",
-                    mime="application/json"
-                )
+                export_result = export_resp.json()
+                if export_result.get("status") == "error":
+                    st.error(export_result.get("message", "Export failed."))
+                else:
+                    st.download_button(
+                        "Download JSON",
+                        data=export_resp.text,
+                        file_name=f"{entity_doc}_export.json",
+                        mime="application/json"
+                    )
+            else:
+                st.error(f"Export failed: {export_resp.text}")
 
 with tab3:
     st.header("📊 Compare Documents")
     st.caption("Compare two ingested documents for shared entities, naming differences, and contradictions.")
 
     try:
-        compare_docs = requests.get(f"{BACKEND_URL}/status").json().get("documents", [])
+        status = requests.get(
+            f"{BACKEND_URL}/status",
+            params={"project": st.session_state.current_project}
+        ).json()
+        if status.get("status") == "error":
+            st.error(status.get("message", "Could not load documents."))
+            compare_docs = []
+        else:
+            compare_docs = status.get("documents", [])
     except Exception:
         compare_docs = []
 
@@ -283,7 +386,11 @@ with tab3:
             with st.spinner("Comparing documents..."):
                 resp = requests.post(
                     f"{BACKEND_URL}/compare_documents",
-                    data={"source_a": document_a, "source_b": document_b}
+                    data={
+                        "source_a": document_a,
+                        "source_b": document_b,
+                        "project": st.session_state.current_project
+                    }
                 )
 
             if resp.status_code == 200:
@@ -348,6 +455,43 @@ if tab4 is not None:
         if audit_result.get("status") == "error":
             st.error(audit_result.get("message", "Could not load audit log."))
         else:
+            audit_df = pd.DataFrame(audit_result.get("logs", []))
+            if audit_df.empty:
+                st.info("No query audit data available for charts.")
+            else:
+                st.subheader("📈 Query Activity")
+                query_counts = (
+                    audit_df.assign(
+                        source_filter=audit_df["source_filter"].fillna("Unfiltered")
+                    )
+                    .groupby("source_filter")
+                    .size()
+                    .rename("Queries")
+                    .to_frame()
+                )
+                st.write("**Queries per document**")
+                st.bar_chart(query_counts)
+
+                confidence_df = audit_df.copy()
+                confidence_df["confidence"] = pd.to_numeric(
+                    confidence_df["confidence"], errors="coerce"
+                )
+                confidence_by_document = (
+                    confidence_df.assign(
+                        source_filter=confidence_df["source_filter"].fillna("Unfiltered")
+                    )
+                    .dropna(subset=["confidence"])
+                    .groupby("source_filter")["confidence"]
+                    .mean()
+                    .rename("Average Confidence")
+                    .to_frame()
+                )
+                st.write("**Average confidence score per document**")
+                if confidence_by_document.empty:
+                    st.info("No confidence scores available.")
+                else:
+                    st.bar_chart(confidence_by_document)
+
             st.subheader("📜 Query Audit Log")
             st.dataframe(audit_result.get("logs", []), use_container_width=True)
 
@@ -360,6 +504,29 @@ if tab4 is not None:
         if reviews_result.get("status") == "error":
             st.error(reviews_result.get("message", "Could not load reviews."))
         else:
+            reviews_df = pd.DataFrame(reviews_result.get("reviews", []))
+            st.subheader("📊 Review Decisions")
+            if reviews_df.empty:
+                st.info("No review data available.")
+            else:
+                decision_counts = (
+                    reviews_df["decision"]
+                    .fillna("Unknown")
+                    .value_counts()
+                    .reindex(["approved", "rejected"], fill_value=0)
+                    .rename_axis("Decision")
+                    .rename("Reviews")
+                    .to_frame()
+                )
+                approved_count = int(decision_counts.loc["approved", "Reviews"])
+                rejected_count = int(decision_counts.loc["rejected", "Reviews"])
+                approved_col, rejected_col = st.columns(2)
+                with approved_col:
+                    st.metric("Approved", approved_count)
+                with rejected_col:
+                    st.metric("Rejected", rejected_count)
+                st.bar_chart(decision_counts)
+
             st.subheader("📝 Answer Reviews")
             st.dataframe(reviews_result.get("reviews", []), use_container_width=True)
 

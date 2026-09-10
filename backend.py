@@ -36,7 +36,7 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs("data", exist_ok=True)
 
 # In-memory storage (loaded/saved to disk)
-chunks_store = []  # list of dicts: {text, page, source, ocr_used}
+chunks_store = []  # list of dicts: {text, page, source, ocr_used, project}
 index = None
 
 
@@ -46,6 +46,14 @@ def load_index():
         index = faiss.read_index(INDEX_PATH)
         with open(CHUNKS_PATH, "rb") as f:
             chunks_store = pickle.load(f)
+        migrated = False
+        for chunk in chunks_store:
+            if "project" not in chunk:
+                chunk["project"] = "default"
+                migrated = True
+        if migrated:
+            with open(CHUNKS_PATH, "wb") as f:
+                pickle.dump(chunks_store, f)
     else:
         index = faiss.IndexFlatL2(384)  # 384 = embedding dim of MiniLM
         chunks_store = []
@@ -85,6 +93,12 @@ def init_db():
         source_filter TEXT,
         username TEXT
     )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS projects (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE,
+        created_by TEXT,
+        created_at TEXT
+    )""")
 
     # Migrate databases created by older versions of the application.
     for table, column in (("query_log", "username"), ("reviews", "username")):
@@ -92,12 +106,28 @@ def init_db():
         if column not in columns:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
 
+    conn.execute(
+        "INSERT OR IGNORE INTO projects (name, created_by, created_at) VALUES (?, ?, ?)",
+        ("default", "system", datetime.now().isoformat())
+    )
+
     conn.commit()
     conn.close()
 
 
 def hash_password(password):
     return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+
+def normalize_project(project):
+    return (project or "default").strip() or "default"
+
+
+def project_exists(project):
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute("SELECT 1 FROM projects WHERE name = ?", (project,)).fetchone()
+    conn.close()
+    return row is not None
 
 
 def log_query(question, source_filter, confidence, username):
@@ -114,6 +144,7 @@ init_db()
 
 
 VALID_ROLES = {"engineer", "reviewer", "admin"}
+AI_SERVICE_ERROR = "The AI service is temporarily unavailable. Please try again in a moment."
 
 
 @app.post("/register")
@@ -153,13 +184,56 @@ async def login(username: str = Form(...), password: str = Form(...)):
     return {"status": "success", "username": row[0], "role": row[1]}
 
 
-def chunk_text(text, page_num, source, ocr_used=False, chunk_size=500):
+@app.post("/projects")
+async def create_project(name: str = Form(...), username: str = Form(...)):
+    name = name.strip()
+    username = username.strip()
+    if not name:
+        return {"status": "error", "message": "Project name is required"}
+
+    conn = sqlite3.connect(DB_PATH)
+    user = conn.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone()
+    if not user:
+        conn.close()
+        return {"status": "error", "message": "A logged-in user is required to create a project"}
+
+    try:
+        conn.execute(
+            "INSERT INTO projects (name, created_by, created_at) VALUES (?, ?, ?)",
+            (name, username, datetime.now().isoformat())
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.close()
+        return {"status": "error", "message": "Project already exists"}
+    conn.close()
+    return {"status": "success", "project": name}
+
+
+@app.get("/projects")
+async def list_projects():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT id, name, created_by, created_at FROM projects ORDER BY name"
+    ).fetchall()
+    conn.close()
+    return {"status": "success", "projects": [dict(row) for row in rows]}
+
+
+def chunk_text(text, page_num, source, project="default", ocr_used=False, chunk_size=500):
     words = text.split()
     chunks = []
     for i in range(0, len(words), chunk_size):
         chunk = " ".join(words[i:i + chunk_size])
         if chunk.strip():
-            chunks.append({"text": chunk, "page": page_num, "source": source, "ocr_used": ocr_used})
+            chunks.append({
+                "text": chunk,
+                "page": page_num,
+                "source": source,
+                "ocr_used": ocr_used,
+                "project": project
+            })
     return chunks
 
 
@@ -174,7 +248,11 @@ def ocr_page(page):
 
 
 @app.post("/upload")
-async def upload_pdf(file: UploadFile = File(...)):
+async def upload_pdf(file: UploadFile = File(...), project: str = Form("default")):
+    project = normalize_project(project)
+    if not project_exists(project):
+        return {"status": "error", "message": "Project not found."}
+
     file_path = os.path.join(UPLOAD_DIR, file.filename)
     with open(file_path, "wb") as f:
         f.write(await file.read())
@@ -196,7 +274,13 @@ async def upload_pdf(file: UploadFile = File(...)):
                 ocr_pages_count += 1
 
         if text.strip():
-            page_chunks = chunk_text(text, page_num, file.filename, ocr_used=used_ocr)
+            page_chunks = chunk_text(
+                text,
+                page_num,
+                file.filename,
+                project=project,
+                ocr_used=used_ocr
+            )
             all_chunks.extend(page_chunks)
 
     doc.close()
@@ -205,7 +289,10 @@ async def upload_pdf(file: UploadFile = File(...)):
         return {"status": "error", "message": "No extractable text found in PDF, even after OCR."}
 
     texts = [c["text"] for c in all_chunks]
-    embeddings = embedder.encode(texts, convert_to_numpy=True)
+    try:
+        embeddings = embedder.encode(texts, convert_to_numpy=True)
+    except Exception:
+        return {"status": "error", "message": AI_SERVICE_ERROR}
 
     global index, chunks_store
     index.add(embeddings.astype('float32'))
@@ -215,6 +302,7 @@ async def upload_pdf(file: UploadFile = File(...)):
     return {
         "status": "success",
         "filename": file.filename,
+        "project": project,
         "pages_processed": total_pages,
         "pages_ocr_used": ocr_pages_count,
         "chunks_created": len(all_chunks)
@@ -222,19 +310,32 @@ async def upload_pdf(file: UploadFile = File(...)):
 
 
 @app.post("/query")
-async def query_docs(question: str = Form(...), top_k: int = Form(4), source_filter: str = Form(None), username: str = Form(None)):
-    if index.ntotal == 0:
+async def query_docs(
+    question: str = Form(...),
+    top_k: int = Form(4),
+    source_filter: str = Form(None),
+    username: str = Form(None),
+    project: str = Form(None)
+):
+    project = normalize_project(project) if project else None
+    project_chunks = [c for c in chunks_store if not project or c.get("project", "default") == project]
+    if not project_chunks or index.ntotal == 0:
         return {"answer": "No documents have been uploaded yet.", "confidence": 0, "sources": []}
 
-    q_embedding = embedder.encode([question], convert_to_numpy=True).astype('float32')
+    try:
+        q_embedding = embedder.encode([question], convert_to_numpy=True).astype('float32')
+    except Exception:
+        return {"status": "error", "message": AI_SERVICE_ERROR}
 
-    search_k = min(top_k * 5, index.ntotal)
+    search_k = index.ntotal if project else min(top_k * 5, index.ntotal)
     distances, indices = index.search(q_embedding, search_k)
 
     retrieved_chunks = []
     for idx, dist in zip(indices[0], distances[0]):
         if idx < len(chunks_store):
             chunk = chunks_store[idx]
+            if project and chunk.get("project", "default") != project:
+                continue
             if source_filter and source_filter != "All Documents" and chunk["source"] != source_filter:
                 continue
             retrieved_chunks.append({
@@ -269,11 +370,14 @@ Question: {question}
 
 Answer:"""
 
-    completion = groq_client.chat.completions.create(
-        model="openai/gpt-oss-20b",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.2
-    )
+    try:
+        completion = groq_client.chat.completions.create(
+            model="openai/gpt-oss-20b",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2
+        )
+    except Exception:
+        return {"status": "error", "message": AI_SERVICE_ERROR}
 
     answer = completion.choices[0].message.content
 
@@ -294,13 +398,27 @@ Answer:"""
 
 
 @app.get("/status")
-async def status():
-    return {"total_chunks": len(chunks_store), "documents": list(set(c["source"] for c in chunks_store))}
+async def status(project: str = Query(None)):
+    project = normalize_project(project) if project else None
+    project_chunks = [
+        c for c in chunks_store
+        if not project or c.get("project", "default") == project
+    ]
+    return {
+        "total_chunks": len(project_chunks),
+        "documents": list(set(c["source"] for c in project_chunks)),
+        "project": project or "all"
+    }
 
 
 @app.post("/extract_entities")
-async def extract_entities(source: str = Form(...)):
-    doc_chunks = [c for c in chunks_store if c["source"] == source]
+async def extract_entities(source: str = Form(...), project: str = Form(None)):
+    project = normalize_project(project) if project else None
+    doc_chunks = [
+        c for c in chunks_store
+        if c["source"] == source
+        and (not project or c.get("project", "default") == project)
+    ]
     if not doc_chunks:
         return {"status": "error", "message": "No chunks found for this document."}
 
@@ -327,11 +445,14 @@ Document text:
 {full_text}
 """
 
-    completion = groq_client.chat.completions.create(
-        model="openai/gpt-oss-20b",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.1
-    )
+    try:
+        completion = groq_client.chat.completions.create(
+            model="openai/gpt-oss-20b",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1
+        )
+    except Exception:
+        return {"status": "error", "message": AI_SERVICE_ERROR}
 
     raw = completion.choices[0].message.content.strip()
 
@@ -346,20 +467,33 @@ Document text:
     except json.JSONDecodeError:
         return {"status": "error", "message": "Could not parse entity extraction result.", "raw": raw}
 
-    return {"status": "success", "source": source, "entities": entities}
+    return {"status": "success", "source": source, "project": project or "all", "entities": entities}
 
 
 @app.post("/compare_documents")
-async def compare_documents(source_a: str = Form(...), source_b: str = Form(...)):
+async def compare_documents(
+    source_a: str = Form(...),
+    source_b: str = Form(...),
+    project: str = Form(None)
+):
     if source_a == source_b:
         return {"status": "error", "message": "Please select two different documents"}
 
+    project = normalize_project(project) if project else None
     chunks_a = sorted(
-        [c for c in chunks_store if c["source"] == source_a],
+        [
+            c for c in chunks_store
+            if c["source"] == source_a
+            and (not project or c.get("project", "default") == project)
+        ],
         key=lambda c: c["page"]
     )
     chunks_b = sorted(
-        [c for c in chunks_store if c["source"] == source_b],
+        [
+            c for c in chunks_store
+            if c["source"] == source_b
+            and (not project or c.get("project", "default") == project)
+        ],
         key=lambda c: c["page"]
     )
 
@@ -408,17 +542,20 @@ DOCUMENT B ({source_b}):
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1
         )
+    except Exception:
+        return {"status": "error", "message": AI_SERVICE_ERROR}
 
-        raw = completion.choices[0].message.content.strip()
+    raw = completion.choices[0].message.content.strip()
 
-        if raw.startswith("```"):
-            lines = raw.splitlines()
-            if lines and lines[0].strip().startswith("```"):
-                lines = lines[1:]
-            if lines and lines[-1].strip() == "```":
-                lines = lines[:-1]
-            raw = "\n".join(lines).strip()
+    if raw.startswith("```"):
+        lines = raw.splitlines()
+        if lines and lines[0].strip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        raw = "\n".join(lines).strip()
 
+    try:
         comparison = json.loads(raw)
         return {"status": "success", "comparison": comparison}
     except json.JSONDecodeError:
@@ -427,19 +564,30 @@ DOCUMENT B ({source_b}):
             "message": "Could not parse document comparison result.",
             "raw": raw
         }
-    except Exception as exc:
-        return {"status": "error", "message": f"Document comparison failed: {exc}"}
 
 
 @app.get("/export/{source}")
-async def export_document(source: str):
-    doc_chunks = [c for c in chunks_store if c["source"] == source]
+async def export_document(source: str, project: str = Query(None)):
+    project = normalize_project(project) if project else None
+    doc_chunks = [
+        c for c in chunks_store
+        if c["source"] == source
+        and (not project or c.get("project", "default") == project)
+    ]
     if not doc_chunks:
         return {"status": "error", "message": "No data found for this document."}
     export_data = {
         "document": source,
+        "project": project or "all",
         "total_chunks": len(doc_chunks),
-        "chunks": [{"page": c["page"], "text": c["text"], "ocr_used": c.get("ocr_used", False)} for c in doc_chunks]
+        "chunks": [
+            {
+                "page": c["page"],
+                "text": c["text"],
+                "ocr_used": c.get("ocr_used", False),
+                "project": c.get("project", "default")
+            } for c in doc_chunks
+        ]
     }
     return export_data
 
