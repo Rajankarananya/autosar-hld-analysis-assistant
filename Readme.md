@@ -6,13 +6,13 @@ An AI-powered assistant for extracting, searching, comparing, and reviewing arch
 
 ### Login and registration
 
-![HLD Assistant login screen](docs/login-screen.png)
+![HLD Assistant login screen](docs/Screenshot%202026-09-10%20at%202.21.05 PM.png)
 
 The application starts behind a local login gate. Users can register as engineers, reviewers, or administrators.
 
 ### Admin audit and review dashboard
 
-![Admin audit and reviews dashboard](docs/admin-audit-reviews.png)
+![Admin audit and reviews dashboard](docs/Screenshot%202026-09-10%20at%202.11.23 PM.png)
 
 Administrators can inspect query and review tables, query volume by document, average confidence, and approved versus rejected review counts.
 
