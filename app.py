@@ -21,8 +21,14 @@ if "username" not in st.session_state:
     st.session_state.username = None
 if "role" not in st.session_state:
     st.session_state.role = None
+if "token" not in st.session_state:
+    st.session_state.token = None
 if "current_project" not in st.session_state:
     st.session_state.current_project = "default"
+
+
+def auth_headers():
+    return {"Authorization": f"Bearer {st.session_state.token}"} if st.session_state.token else {}
 
 
 if not st.session_state.logged_in:
@@ -43,6 +49,7 @@ if not st.session_state.logged_in:
             st.session_state.logged_in = True
             st.session_state.username = result["username"]
             st.session_state.role = result["role"]
+            st.session_state.token = result["token"]
             st.rerun()
         else:
             st.error(result.get("message", "Login failed."))
@@ -55,6 +62,7 @@ if not st.session_state.logged_in:
                 "Role",
                 ["engineer", "reviewer", "admin"]
             )
+            register_invite_code = st.text_input("Invite code", type="password")
             register_submitted = st.form_submit_button("Register")
 
         if register_submitted:
@@ -63,7 +71,8 @@ if not st.session_state.logged_in:
                 data={
                     "username": register_username,
                     "password": register_password,
-                    "role": register_role
+                    "role": register_role,
+                    "invite_code": register_invite_code
                 }
             )
             result = response.json()
@@ -81,13 +90,14 @@ with st.sidebar:
         st.session_state.logged_in = False
         st.session_state.username = None
         st.session_state.role = None
+        st.session_state.token = None
         st.session_state.current_project = "default"
         st.rerun()
 
     st.divider()
     st.header("🗂️ Project")
     try:
-        projects_response = requests.get(f"{BACKEND_URL}/projects")
+        projects_response = requests.get(f"{BACKEND_URL}/projects", headers=auth_headers())
         projects_result = projects_response.json()
         if projects_result.get("status") == "error":
             st.error(projects_result.get("message", "Could not load projects."))
@@ -118,7 +128,8 @@ with st.sidebar:
     if st.button("Create Project"):
         project_response = requests.post(
             f"{BACKEND_URL}/projects",
-            data={"name": new_project, "username": st.session_state.username}
+            data={"name": new_project},
+            headers=auth_headers()
         )
         project_result = project_response.json()
         if project_result.get("status") == "success":
@@ -138,7 +149,8 @@ with st.sidebar:
                 response = requests.post(
                     f"{BACKEND_URL}/upload",
                     files=files,
-                    data={"project": st.session_state.current_project}
+                    data={"project": st.session_state.current_project},
+                    headers=auth_headers()
                 )
                 if response.status_code == 200:
                     result = response.json()
@@ -155,7 +167,8 @@ with st.sidebar:
     try:
         status_response = requests.get(
             f"{BACKEND_URL}/status",
-            params={"project": st.session_state.current_project}
+            params={"project": st.session_state.current_project},
+            headers=auth_headers()
         )
         status = status_response.json()
         if status.get("status") == "error":
@@ -192,7 +205,8 @@ with tab1:
         try:
             status = requests.get(
                 f"{BACKEND_URL}/status",
-                params={"project": st.session_state.current_project}
+                params={"project": st.session_state.current_project},
+                headers=auth_headers()
             ).json()
             if status.get("status") == "error":
                 st.error(status.get("message", "Could not load documents."))
@@ -211,9 +225,9 @@ with tab1:
                     "question": question,
                     "top_k": top_k,
                     "source_filter": selected_doc,
-                    "username": st.session_state.username,
                     "project": st.session_state.current_project
-                }
+                },
+                headers=auth_headers()
             )
             if response.status_code == 200:
                 result = response.json()
@@ -260,9 +274,7 @@ with tab1:
                         "answer": result["answer"],
                         "decision": "approved",
                         "source_filter": st.session_state.last_doc,
-                        "role": st.session_state.role,
-                        "username": st.session_state.username
-                    })
+                    }, headers=auth_headers())
                     review_result = review_resp.json()
                     if review_result.get("status") == "success":
                         st.success("Marked as approved")
@@ -275,9 +287,7 @@ with tab1:
                         "answer": result["answer"],
                         "decision": "rejected",
                         "source_filter": st.session_state.last_doc,
-                        "role": st.session_state.role,
-                        "username": st.session_state.username
-                    })
+                    }, headers=auth_headers())
                     review_result = review_resp.json()
                     if review_result.get("status") == "success":
                         st.warning("Marked as rejected")
@@ -291,7 +301,8 @@ with tab2:
     try:
         status = requests.get(
             f"{BACKEND_URL}/status",
-            params={"project": st.session_state.current_project}
+            params={"project": st.session_state.current_project},
+            headers=auth_headers()
         ).json()
         if status.get("status") == "error":
             st.error(status.get("message", "Could not load documents."))
@@ -312,7 +323,8 @@ with tab2:
                     data={
                         "source": entity_doc,
                         "project": st.session_state.current_project
-                    }
+                    },
+                    headers=auth_headers()
                 )
                 if resp.status_code == 200:
                     result = resp.json()
@@ -340,7 +352,8 @@ with tab2:
         if st.button("📥 Export Document Data as JSON"):
             export_resp = requests.get(
                 f"{BACKEND_URL}/export/{entity_doc}",
-                params={"project": st.session_state.current_project}
+                params={"project": st.session_state.current_project},
+                headers=auth_headers()
             )
             if export_resp.status_code == 200:
                 export_result = export_resp.json()
@@ -363,7 +376,8 @@ with tab3:
     try:
         status = requests.get(
             f"{BACKEND_URL}/status",
-            params={"project": st.session_state.current_project}
+            params={"project": st.session_state.current_project},
+            headers=auth_headers()
         ).json()
         if status.get("status") == "error":
             st.error(status.get("message", "Could not load documents."))
@@ -390,7 +404,8 @@ with tab3:
                         "source_a": document_a,
                         "source_b": document_b,
                         "project": st.session_state.current_project
-                    }
+                    },
+                    headers=auth_headers()
                 )
 
             if resp.status_code == 200:
@@ -449,7 +464,7 @@ if tab4 is not None:
 
         audit_resp = requests.get(
             f"{BACKEND_URL}/audit_log",
-            params={"role": st.session_state.role}
+            headers=auth_headers()
         )
         audit_result = audit_resp.json()
         if audit_result.get("status") == "error":
@@ -498,7 +513,7 @@ if tab4 is not None:
         st.divider()
         reviews_resp = requests.get(
             f"{BACKEND_URL}/reviews",
-            params={"role": st.session_state.role}
+            headers=auth_headers()
         )
         reviews_result = reviews_resp.json()
         if reviews_result.get("status") == "error":

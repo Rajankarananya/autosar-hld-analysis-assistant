@@ -6,3 +6,6 @@ data/
 uploads/
 .DS_Store
 EOF
+eval/*_pages.txt
+eval/__pycache__/
+eval/

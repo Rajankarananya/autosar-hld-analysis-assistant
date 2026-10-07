@@ -1,5 +1,11 @@
 import os
-import fitz  # PyMuPDF
+import secrets
+import shutil
+import warnings
+try:
+    import pymupdf as fitz
+except ModuleNotFoundError:
+    import fitz  # PyMuPDF
 import faiss
 import numpy as np
 import pickle
@@ -7,16 +13,32 @@ import io
 import json
 import sqlite3
 import hashlib
+import bcrypt
 from datetime import datetime
 from PIL import Image
 import pytesseract
-pytesseract.pytesseract.tesseract_cmd = "/opt/homebrew/bin/tesseract"
-from fastapi import FastAPI, UploadFile, File, Form, Query
-from sentence_transformers import SentenceTransformer
-from groq import Groq
 from dotenv import load_dotenv
 
 load_dotenv()
+
+TESSERACT_CMD = os.getenv("TESSERACT_CMD") or shutil.which("tesseract")
+if TESSERACT_CMD:
+    pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
+else:
+    warnings.warn("Tesseract was not found. OCR will be unavailable until Tesseract is installed.")
+from fastapi import Depends, FastAPI, HTTPException, UploadFile, File, Form, Query
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
+from sentence_transformers import SentenceTransformer
+from groq import Groq
+
+AUTH_SECRET = os.getenv("AUTH_SECRET")
+if not AUTH_SECRET:
+    AUTH_SECRET = secrets.token_urlsafe(32)
+    warnings.warn("AUTH_SECRET is missing. A temporary signing secret was generated for this process.")
+token_serializer = URLSafeTimedSerializer(AUTH_SECRET, salt="autosar-hld-auth")
+bearer_scheme = HTTPBearer(auto_error=False)
+TOKEN_MAX_AGE = 8 * 60 * 60
 
 app = FastAPI()
 
@@ -116,7 +138,49 @@ def init_db():
 
 
 def hash_password(password):
-    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def verify_password(password, stored_hash):
+    if stored_hash.startswith("$2"):
+        return bcrypt.checkpw(password.encode("utf-8"), stored_hash.encode("utf-8")), False
+    legacy_hash = hashlib.sha256(password.encode("utf-8")).hexdigest()
+    return secrets.compare_digest(legacy_hash, stored_hash), True
+
+
+def create_token(username):
+    return token_serializer.dumps({"username": username})
+
+
+def current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+):
+    if credentials is None:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    try:
+        payload = token_serializer.loads(credentials.credentials, max_age=TOKEN_MAX_AGE)
+    except SignatureExpired as exc:
+        raise HTTPException(status_code=401, detail="Authentication token expired") from exc
+    except BadSignature as exc:
+        raise HTTPException(status_code=401, detail="Invalid authentication token") from exc
+
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute(
+        "SELECT username, role FROM users WHERE username = ?",
+        (payload.get("username"),)
+    ).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=401, detail="User no longer exists")
+    return {"username": row[0], "role": row[1]}
+
+
+def require_roles(*roles):
+    def dependency(user=Depends(current_user)):
+        if user["role"] not in roles:
+            raise HTTPException(status_code=403, detail="Insufficient permissions")
+        return user
+    return dependency
 
 
 def normalize_project(project):
@@ -147,13 +211,84 @@ VALID_ROLES = {"engineer", "reviewer", "admin"}
 AI_SERVICE_ERROR = "The AI service is temporarily unavailable. Please try again in a moment."
 
 
+def call_llm_json(prompt, operation):
+    request_options = {
+        "model": "openai/gpt-oss-20b",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.1,
+        "max_completion_tokens": 2048,
+        "reasoning_effort": "low",
+        "response_format": {"type": "json_object"},
+    }
+    last_raw = ""
+    last_finish_reason = None
+    for attempt in range(2):
+        try:
+            completion = groq_client.chat.completions.create(**request_options)
+        except Exception as exc:
+            if attempt == 0:
+                request_options.pop("reasoning_effort", None)
+                request_options.pop("response_format", None)
+                continue
+            print(f"[LLM ERROR] operation={operation} error={exc}")
+            return None, {"status": "error", "message": AI_SERVICE_ERROR}
+
+        choice = completion.choices[0]
+        raw = (choice.message.content or "").strip()
+        last_raw = raw
+        last_finish_reason = getattr(choice, "finish_reason", None)
+        usage = getattr(completion, "usage", None)
+        details = getattr(usage, "completion_tokens_details", None) if usage else None
+        print(
+            "[LLM DEBUG] "
+            f"operation={operation} attempt={attempt + 1} "
+            f"finish_reason={last_finish_reason!r} "
+            f"completion_tokens={getattr(usage, 'completion_tokens', None)} "
+            f"reasoning_tokens={getattr(details, 'reasoning_tokens', None)} "
+            f"raw_length={len(raw)}"
+        )
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                return json.loads(raw[start:end + 1]), None
+            except json.JSONDecodeError:
+                pass
+
+    if last_finish_reason == "length":
+        return None, {
+            "status": "error",
+            "message": "The model response was cut off. Try smaller documents."
+        }
+    return None, {
+        "status": "error",
+        "message": "Could not parse the model JSON response.",
+        "raw": last_raw
+    }
+
+
 @app.post("/register")
-async def register(username: str = Form(...), password: str = Form(...), role: str = Form(...)):
+async def register(
+    username: str = Form(...),
+    password: str = Form(...),
+    role: str = Form(...),
+    invite_code: str = Form("")
+):
     username = username.strip()
     if not username or not password:
         return {"status": "error", "message": "Username and password are required"}
     if role not in VALID_ROLES:
         return {"status": "error", "message": "Invalid role"}
+    if role == "reviewer" and (
+        not os.getenv("REVIEWER_INVITE_CODE")
+        or invite_code != os.getenv("REVIEWER_INVITE_CODE")
+    ):
+        return {"status": "error", "message": "A valid reviewer invite code is required"}
+    if role == "admin" and (
+        not os.getenv("ADMIN_INVITE_CODE")
+        or invite_code != os.getenv("ADMIN_INVITE_CODE")
+    ):
+        return {"status": "error", "message": "A valid admin invite code is required"}
 
     conn = sqlite3.connect(DB_PATH)
     try:
@@ -174,20 +309,32 @@ async def register(username: str = Form(...), password: str = Form(...), role: s
 async def login(username: str = Form(...), password: str = Form(...)):
     conn = sqlite3.connect(DB_PATH)
     row = conn.execute(
-        "SELECT username, role FROM users WHERE username = ? AND password_hash = ?",
-        (username.strip(), hash_password(password))
+        "SELECT username, role, password_hash FROM users WHERE username = ?",
+        (username.strip(),)
     ).fetchone()
-    conn.close()
-
-    if not row:
+    if not row or not verify_password(password, row[2])[0]:
+        conn.close()
         return {"status": "error", "message": "Invalid credentials"}
-    return {"status": "success", "username": row[0], "role": row[1]}
+    if verify_password(password, row[2])[1]:
+        conn.execute(
+            "UPDATE users SET password_hash = ? WHERE username = ?",
+            (hash_password(password), row[0])
+        )
+        conn.commit()
+    conn.close()
+    return {
+        "status": "success",
+        "username": row[0],
+        "role": row[1],
+        "token": create_token(row[0]),
+        "expires_in": TOKEN_MAX_AGE
+    }
 
 
 @app.post("/projects")
-async def create_project(name: str = Form(...), username: str = Form(...)):
+async def create_project(name: str = Form(...), user=Depends(current_user)):
     name = name.strip()
-    username = username.strip()
+    username = user["username"]
     if not name:
         return {"status": "error", "message": "Project name is required"}
 
@@ -248,7 +395,7 @@ def ocr_page(page):
 
 
 @app.post("/upload")
-async def upload_pdf(file: UploadFile = File(...), project: str = Form("default")):
+async def upload_pdf(file: UploadFile = File(...), project: str = Form("default"), user=Depends(current_user)):
     project = normalize_project(project)
     if not project_exists(project):
         return {"status": "error", "message": "Project not found."}
@@ -314,8 +461,8 @@ async def query_docs(
     question: str = Form(...),
     top_k: int = Form(4),
     source_filter: str = Form(None),
-    username: str = Form(None),
-    project: str = Form(None)
+    project: str = Form(None),
+    user=Depends(current_user)
 ):
     project = normalize_project(project) if project else None
     project_chunks = [c for c in chunks_store if not project or c.get("project", "default") == project]
@@ -381,7 +528,7 @@ Answer:"""
 
     answer = completion.choices[0].message.content
 
-    log_query(question, source_filter, confidence, username)
+    log_query(question, source_filter, confidence, user["username"])
 
     return {
         "answer": answer,
@@ -398,7 +545,7 @@ Answer:"""
 
 
 @app.get("/status")
-async def status(project: str = Query(None)):
+async def status(project: str = Query(None), user=Depends(current_user)):
     project = normalize_project(project) if project else None
     project_chunks = [
         c for c in chunks_store
@@ -412,7 +559,7 @@ async def status(project: str = Query(None)):
 
 
 @app.post("/extract_entities")
-async def extract_entities(source: str = Form(...), project: str = Form(None)):
+async def extract_entities(source: str = Form(...), project: str = Form(None), user=Depends(current_user)):
     project = normalize_project(project) if project else None
     doc_chunks = [
         c for c in chunks_store
@@ -439,33 +586,17 @@ Return ONLY valid JSON, no other text, in exactly this format:
   "signals": ["name1", "name2"]
 }}
 
-If a category has no clear entries, return an empty list for it. Do not invent entities not mentioned in the text.
+If a category has no clear entries, return an empty list for it. Do not invent entities not mentioned in the text. Use short names and return at most 30 items per list.
 
 Document text:
 {full_text}
 """
 
-    try:
-        completion = groq_client.chat.completions.create(
-            model="openai/gpt-oss-20b",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1
-        )
-    except Exception:
-        return {"status": "error", "message": AI_SERVICE_ERROR}
-
-    raw = completion.choices[0].message.content.strip()
-
-    if raw.startswith("```"):
-        raw = raw.strip("`")
-        if raw.startswith("json"):
-            raw = raw[4:]
-        raw = raw.strip()
-
-    try:
-        entities = json.loads(raw)
-    except json.JSONDecodeError:
-        return {"status": "error", "message": "Could not parse entity extraction result.", "raw": raw}
+    entities, error = call_llm_json(prompt, "extract_entities")
+    if error:
+        return error
+    for category in ("components", "interfaces", "ports", "signals"):
+        entities[category] = entities.get(category, [])[:30]
 
     return {"status": "success", "source": source, "project": project or "all", "entities": entities}
 
@@ -474,7 +605,8 @@ Document text:
 async def compare_documents(
     source_a: str = Form(...),
     source_b: str = Form(...),
-    project: str = Form(None)
+    project: str = Form(None),
+    user=Depends(current_user)
 ):
     if source_a == source_b:
         return {"status": "error", "message": "Please select two different documents"}
@@ -527,7 +659,7 @@ Return ONLY valid JSON in exactly this format:
   "only_in_doc_b": ["EntityName"]
 }}
 
-If a category has no entries, return an empty list.
+If a category has no entries, return an empty list. Use short entity names and return at most 30 items in each list.
 
 DOCUMENT A ({source_a}):
 {text_a}
@@ -536,38 +668,17 @@ DOCUMENT B ({source_b}):
 {text_b}
 """
 
-    try:
-        completion = groq_client.chat.completions.create(
-            model="openai/gpt-oss-20b",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1
-        )
-    except Exception:
-        return {"status": "error", "message": AI_SERVICE_ERROR}
-
-    raw = completion.choices[0].message.content.strip()
-
-    if raw.startswith("```"):
-        lines = raw.splitlines()
-        if lines and lines[0].strip().startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        raw = "\n".join(lines).strip()
-
-    try:
-        comparison = json.loads(raw)
-        return {"status": "success", "comparison": comparison}
-    except json.JSONDecodeError:
-        return {
-            "status": "error",
-            "message": "Could not parse document comparison result.",
-            "raw": raw
-        }
+    comparison, error = call_llm_json(prompt, "compare_documents")
+    if error:
+        return error
+    for category in ("shared_entities", "only_in_doc_a", "only_in_doc_b"):
+        comparison[category] = comparison.get(category, [])[:30]
+    comparison["inconsistencies"] = comparison.get("inconsistencies", [])[:30]
+    return {"status": "success", "comparison": comparison}
 
 
 @app.get("/export/{source}")
-async def export_document(source: str, project: str = Query(None)):
+async def export_document(source: str, project: str = Query(None), user=Depends(current_user)):
     project = normalize_project(project) if project else None
     doc_chunks = [
         c for c in chunks_store
@@ -593,10 +704,7 @@ async def export_document(source: str, project: str = Query(None)):
 
 
 @app.get("/audit_log")
-async def get_audit_log(role: str = Query(...)):
-    if role != "admin":
-        return {"status": "error", "message": "Insufficient permissions: admin role required"}
-
+async def get_audit_log(user=Depends(require_roles("admin"))):
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     rows = conn.execute("SELECT * FROM query_log ORDER BY id DESC LIMIT 50").fetchall()
@@ -608,16 +716,12 @@ async def submit_review(
     answer: str = Form(...),
     decision: str = Form(...),
     source_filter: str = Form(None),
-    role: str = Form(...),
-    username: str = Form(...)
+    user=Depends(require_roles("reviewer", "admin"))
 ):
-    if role not in ("reviewer", "admin"):
-        return {"status": "error", "message": "Insufficient permissions: reviewer role required"}
-
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
         "INSERT INTO reviews (timestamp, question, answer, decision, source_filter, username) VALUES (?, ?, ?, ?, ?, ?)",
-        (datetime.now().isoformat(), question, answer, decision, source_filter, username)
+        (datetime.now().isoformat(), question, answer, decision, source_filter, user["username"])
     )
     conn.commit()
     conn.close()
@@ -625,10 +729,7 @@ async def submit_review(
 
 
 @app.get("/reviews")
-async def get_reviews(role: str = Query(...)):
-    if role != "admin":
-        return {"status": "error", "message": "Insufficient permissions: admin role required"}
-
+async def get_reviews(user=Depends(require_roles("admin"))):
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     try:

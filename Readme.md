@@ -97,6 +97,8 @@ Every ingested chunk carries a `project` value. Existing data is migrated to the
 
 Authorization is enforced by the backend as well as reflected in the UI. Hiding a button is not the security boundary.
 
+Login returns an expiring signed bearer token. Protected API calls read the user and current role from SQLite on every request. Reviewer and administrator registration requires the corresponding invite code from the environment.
+
 ## API overview
 
 | Method | Endpoint | Purpose |
@@ -112,8 +114,8 @@ Authorization is enforced by the backend as well as reflected in the UI. Hiding 
 | `POST` | `/compare_documents` | Compare two documents within a project |
 | `GET` | `/export/{source}?project=...` | Export project-scoped document data |
 | `POST` | `/review` | Submit reviewer/admin feedback |
-| `GET` | `/audit_log?role=admin` | Read query audit data |
-| `GET` | `/reviews?role=admin` | Read review history |
+| `GET` | `/audit_log` | Read query audit data with an administrator token |
+| `GET` | `/reviews` | Read review history with an administrator token |
 
 ## Running locally
 
@@ -127,6 +129,9 @@ Create a `.env` file with the Groq credential:
 
 ```bash
 GROQ_API_KEY=your_key_here
+AUTH_SECRET=generate-a-long-random-secret
+REVIEWER_INVITE_CODE=replace-with-reviewer-code
+ADMIN_INVITE_CODE=replace-with-admin-code
 ```
 
 Start the backend in one terminal:
@@ -170,7 +175,8 @@ The container is intentionally a pilot deployment with both processes in one con
 
 - SQLite is used instead of PostgreSQL for local pilot simplicity.
 - FAISS and pickle-backed metadata are local stores; production deployments should use durable, managed storage.
-- Local authentication uses SHA-256 as a pilot simplification. This is not production-grade password storage; production should use a dedicated identity provider or a password hashing scheme such as Argon2 or bcrypt.
+- New passwords use bcrypt. Existing SHA-256 users are upgraded after a successful login. A dedicated identity provider is still recommended for production.
+- The temporary signing secret generated when `AUTH_SECRET` is missing is not suitable for multi-process or restart-persistent deployments.
 - There is no OAuth or SSO integration.
 - Backend and frontend run together in the provided single-container Docker command.
 
